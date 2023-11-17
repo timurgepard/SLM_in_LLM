@@ -2,13 +2,21 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-dropout = 0.5
+dropout = 0.1
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(device)
 
 torch.manual_seed(1337)
 
+
+
+
+class Spike(nn.Module):
+    def __init__(self, dim):
+        super(Spike, self).__init__()
+        self.ln = nn.LayerNorm(dim)
+    def forward(self, x):
+        x = self.ln(x)
+        return (x>0.0)*x*torch.tanh(x)
 
 
 
@@ -19,9 +27,7 @@ class FeedForward(nn.Module):
 
 
         self.net = nn.Sequential(
-            nn.LayerNorm(f_in),
             nn.Linear(f_in, f_in),
-            nn.Dropout(dropout),
             nn.ReLU(),
             nn.Linear(f_in, f_out),
             nn.Dropout(dropout)
@@ -32,33 +38,39 @@ class FeedForward(nn.Module):
 
 
 class FourierTransform(nn.Module):
-    def __init__(self, time_intervals, f_in, f_out):
+    def __init__(self, device, time_intervals, f_in, f_out):
         super().__init__()
 
         self.value = nn.Linear(f_in, f_in, bias=False)
         self.fft = nn.Linear(time_intervals, time_intervals, bias=False)
-        self.project = nn.Linear(f_in, f_out, bias=False)
-
-        self.tril = torch.tril(torch.ones((time_intervals, time_intervals))).to(device)
-        self.tril_W = self.tril/self.tril.sum(dim=1, keepdim=True)
+        self.lnx = nn.LayerNorm(f_in)
+        self.lnt = nn.LayerNorm(time_intervals)
 
         
-    def forward(self, input):
+        self.project = nn.Linear(f_in, f_out, bias=False)
+        self.tril = torch.tril(torch.ones((time_intervals, time_intervals))).to(device)
+        self.tril_W = self.tril/self.tril.sum(dim=1, keepdim=True)
+        self.step = 0
 
+    
+    def forward(self, input):
         B,T,E = input.shape
         x = self.value(input)
-        x =x.reshape(B, E, T)
-        x = nn.functional.linear(x, self.tril_W[:T,:T] * self.fft.weight, self.fft.bias)
+        if self.step%2!=0: x = self.lnx(x)
+        x = x.reshape(B, E, T)
+        if self.step%2==0: x = self.lnt(x)
+        x = nn.functional.linear(x, self.tril_W[:T,:T] * self.fft.weight[:T,:T], None)
         x = x.reshape(B, T, E)
+        self.step += 1
         return self.project(x)
 
 
 
 class Block(nn.Module):
-    def __init__(self,  time_intervals, n_embed, n_head):
+    def __init__(self, device, time_intervals, n_embed, n_head):
         super().__init__()
         head_size = n_embed//n_head
-        self.heads = nn.ModuleList([FourierTransform(time_intervals, n_embed, head_size) for i in range(n_head)])
+        self.heads = nn.ModuleList([FourierTransform(device, time_intervals, n_embed, head_size) for i in range(n_head)])
         self.ffw = FeedForward(n_embed, n_embed)
         self.ln1 = nn.LayerNorm(n_embed)
         self.ln2 = nn.LayerNorm(n_embed)
@@ -74,41 +86,41 @@ class Block(nn.Module):
 
 
 class BigramLanguageModel(nn.Module):
-    def __init__(self, vocab_size, time_intervals, n_embed, n_head, n_layers):
+    def __init__(self, vocab_size, time_intervals, vocab_embed, n_embed, n_head, n_layers, device="cpu"):
         super().__init__()
-        self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
-        self.position_embedding_table = nn.Embedding(time_intervals, n_embed)
+        self.device = device
+        self.token_embedding_table = nn.Embedding(vocab_size, vocab_embed)
+        self.position_embedding_table = nn.Embedding(time_intervals, vocab_embed)
 
-        self.blocks = nn.Sequential(*[Block(time_intervals, n_embed, n_head) for _ in range(n_layers)])
+        self.ln_in = nn.LayerNorm(vocab_embed)
+        self.uniform = nn.Linear(vocab_embed, n_embed)
 
-        self.normalize = nn.LayerNorm(n_embed)
+        self.blocks = nn.Sequential(*[Block(device, time_intervals, n_embed, n_head) for _ in range(n_layers)])
+
+        
+        self.ln_out = nn.LayerNorm(n_embed)
         
         self.linear_head = nn.Linear(n_embed, vocab_size)
 
         self.time_intervals = time_intervals
 
-    def etoi(self, logits):
-        probs = F.softmax(logits, dim=-1)
-        idxs = torch.multinomial(probs, num_samples=1).squeeze() #B,T
-        return idxs
+        self.cdist = torch.distributions.categorical
 
-    def forward(self, idx, ext_logits=None, ext_encoder=False, ext_decoder=False, targets=None):
+
+
+    def forward(self, idx, targets=None):
         
         B, T = idx.shape
-
-        if ext_decoder: ext_tok_emb = self.token_embedding_table(self.etoi(ext_logits))
-
+            
         tok_emb = self.token_embedding_table(idx) # B, T, E
-        pos_emb = self.position_embedding_table(torch.arange(T, device=device))
+        pos_emb = self.position_embedding_table(torch.arange(T, device=self.device))
 
-        
         x = tok_emb + pos_emb
-        if ext_encoder: x += ext_logits
-        if ext_decoder: x += ext_tok_emb
 
-        x = self.blocks(x)
-        x = self.normalize(x)
-        logits = self.linear_head(x)
+        x = self.uniform(self.ln_in(x))
+
+        embed  = self.ln_out(self.blocks(x))
+        logits = self.linear_head(embed)
         if targets is None:
             loss = None
         else:
@@ -117,23 +129,32 @@ class BigramLanguageModel(nn.Module):
             targets = targets.view(B*T)
             loss = F.cross_entropy(logits, targets)
 
-        return logits, loss
+        return embed, logits, loss
     
+    
+    def decode(self, idx):
+        with torch.no_grad():
+            _, logits, _ = self(idx)
+            probs = F.softmax(logits, dim=-1)
+            m = self.cdist.Categorical(probs)
+            idx = m.sample()
+            return idx
 
-
-    def generate(self, idx, max_new_tokens, ext_logits=None, ext_encoder=False, ext_decoder=False):
+    def generate(self, idx, max_new_tokens, LLM=None):
         #idx is (B, T) array of indices in the current context
-        for _ in range(max_new_tokens):
-            # crop idx to the last block_size tokens
-            idx_cond = idx[:, -self.time_intervals:]
-            # get the predictions
-            logits, loss = self(idx_cond, ext_logits, ext_encoder, ext_decoder)
-            #focus only on the last time step
-            logits = logits[:, -1, :] #become (B, C)
-            # apply softmax to get probabilities
-            probs = F.softmax(logits, dim=-1) #(B, C)
-            # sample from distribution
-            idx_next = torch.multinomial(probs, num_samples=1) #(B,1)
-            # append sampled index to the running sequence
-            idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
+        with torch.no_grad():
+            for _ in range(max_new_tokens):
+                # crop idx to the last block_size tokens
+                idx_cond = idx[:, -self.time_intervals:]
+                # get the predictions
+                idx_cond_next = LLM.decode(idx_cond) if LLM != None else idx_cond
+                _, logits, _ = self(idx_cond_next)
+                #focus only on the last time step
+                logits = logits[:, -1, :] #become (B, C)
+                # apply softmax to get probabilities
+                probs = F.softmax(logits, dim=-1) #(B, C)
+                # sample from distribution
+                idx_next = torch.multinomial(probs, num_samples=1) #(B,1)
+                # append sampled index to the running sequence
+                idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
         return idx
